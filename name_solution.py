@@ -192,7 +192,7 @@ def main():
             action = choose_action(game_state)
             game_state = simulator.step(action)
             
-        sleep(0.5)  # You may modify this if you want to speed up your simulation
+        sleep(0.05)  # You may modify this if you want to speed up your simulation
         simulator.root.update()  # Ensure Tkinter processes events even when game is not running
 
 if __name__ == "__main__":
