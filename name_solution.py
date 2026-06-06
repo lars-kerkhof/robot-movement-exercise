@@ -10,8 +10,6 @@ _belief = {
     "obstacles":      set(),  # (x, y) tiles ever read 1.0 -> definitely walls
     "free":           set(),  # (x, y) tiles ever stood on / read 0.0 / known goal
     "goal":           None,   # (x, y) once spotted (perception value 2.0)
-    # 0.5 readings are ignored (they're both "ambiguous" and the default for
-    # cells outside the sensor cone, so we can't distinguish the two).
     "low_reads":      {},     # (x, y) -> count of 0.25 readings  (evidence: free)
     "high_reads":     {},     # (x, y) -> count of 0.75 readings  (evidence: wall)
     "soft_obstacles": set(),  # cells we've given up on after repeated re-rolls
@@ -186,7 +184,7 @@ def choose_action(game_state: GameState) -> str:
     if orient_letter != needed:
         return needed
 
-    # Look-before-you-leap, using *accumulated* evidence rather than the last
+    # Uses evidence rather than the last
     # single reading. A real obstacle very rarely sustains low > high without
     # ever hitting 1.0, so this is much safer than trusting one 0.25.
     if next_cell not in free:
