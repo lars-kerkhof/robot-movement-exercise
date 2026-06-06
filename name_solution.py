@@ -192,7 +192,7 @@ def choose_action(game_state: GameState) -> str:
     if next_cell not in free:
         low = low_reads.get(next_cell, 0)
         high = high_reads.get(next_cell, 0)
-        if not (low >= 2 and low > high):
+        if not (low >= 3 and low > high):
             if _belief["stuck_target"] != next_cell:
                 _belief["stuck_target"] = next_cell
                 _belief["stuck_count"] = 0
