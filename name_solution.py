@@ -19,6 +19,7 @@ _belief = {
     "stuck_count":    0,      # consecutive re-rolls on stuck_target
     "shape":          None,   # used to detect a sim reset
     "last_pos":       None,   # used to detect a sim reset (position teleport)
+    "declared_unsolvable": False,  # one-shot flag for the unsolvable message
 }
 
 _ORIENT_TO_LETTER = {"NORTH": "N", "SOUTH": "S", "EAST": "E", "WEST": "W"}
@@ -37,6 +38,7 @@ def _reset_belief(shape):
     _belief["stuck_count"] = 0
     _belief["shape"] = shape
     _belief["last_pos"] = None
+    _belief["declared_unsolvable"] = False
 
 
 def _maybe_reset(game_state):
@@ -176,6 +178,12 @@ def choose_action(game_state: GameState) -> str:
         path = find_path(loose_passable)
 
     if path is None or len(path) < 2:
+        # No reachable frontier and no goal: we're sealed in a pocket.
+        # Tell the user once and idle until they reset the simulation.
+        if goal is None and not _belief["declared_unsolvable"]:
+            print("[choose_action] No reachable unexplored cells and goal not "
+                  "seen -- map appears unsolvable. Please reset the simulation.")
+            _belief["declared_unsolvable"] = True
         return 'E' if orient_letter == 'N' else 'N'
 
     next_cell = path[1]
