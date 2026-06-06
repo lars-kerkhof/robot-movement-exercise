@@ -7,11 +7,18 @@ from collections import deque
 # The simulator regenerates noisy perception every tick, so we keep our own
 # locked-in knowledge here.
 _belief = {
-    "obstacles": set(),  # (x, y) tiles ever read as 1.0 -> definitely walls
-    "free":      set(),  # (x, y) tiles ever stood on / read 0.0 / known goal
-    "goal":      None,   # (x, y) once spotted (perception value 2.0)
-    "shape":     None,   # (h, w) of last seen map, used to detect a sim reset
-    "last_pos":  None,   # used to detect a sim reset (position teleport)
+    "obstacles":      set(),  # (x, y) tiles ever read 1.0 -> definitely walls
+    "free":           set(),  # (x, y) tiles ever stood on / read 0.0 / known goal
+    "goal":           None,   # (x, y) once spotted (perception value 2.0)
+    # 0.5 readings are ignored (they're both "ambiguous" and the default for
+    # cells outside the sensor cone, so we can't distinguish the two).
+    "low_reads":      {},     # (x, y) -> count of 0.25 readings  (evidence: free)
+    "high_reads":     {},     # (x, y) -> count of 0.75 readings  (evidence: wall)
+    "soft_obstacles": set(),  # cells we've given up on after repeated re-rolls
+    "stuck_target":   None,   # cell we've been spinning at
+    "stuck_count":    0,      # consecutive re-rolls on stuck_target
+    "shape":          None,   # used to detect a sim reset
+    "last_pos":       None,   # used to detect a sim reset (position teleport)
 }
 
 _ORIENT_TO_LETTER = {"NORTH": "N", "SOUTH": "S", "EAST": "E", "WEST": "W"}
@@ -23,6 +30,11 @@ def _reset_belief(shape):
     _belief["obstacles"] = set()
     _belief["free"] = set()
     _belief["goal"] = None
+    _belief["low_reads"] = {}
+    _belief["high_reads"] = {}
+    _belief["soft_obstacles"] = set()
+    _belief["stuck_target"] = None
+    _belief["stuck_count"] = 0
     _belief["shape"] = shape
     _belief["last_pos"] = None
 
@@ -55,6 +67,10 @@ def _update_belief(game_state):
             elif v == 2.0:
                 _belief["goal"] = cell
                 _belief["free"].add(cell)
+            elif v == 0.25:
+                _belief["low_reads"][cell] = _belief["low_reads"].get(cell, 0) + 1
+            elif v == 0.75:
+                _belief["high_reads"][cell] = _belief["high_reads"].get(cell, 0) + 1
     _belief["last_pos"] = (cx, cy)
 
 
@@ -105,21 +121,36 @@ def choose_action(game_state: GameState) -> str:
     pos = game_state.current_position
     orient_letter = _ORIENT_TO_LETTER[game_state.current_orientation.name]
 
-    obstacles = _belief["obstacles"]
-    free = _belief["free"]
-    goal = _belief["goal"]
+    obstacles      = _belief["obstacles"]
+    free           = _belief["free"]
+    goal           = _belief["goal"]
+    low_reads      = _belief["low_reads"]
+    high_reads     = _belief["high_reads"]
+    soft_obstacles = _belief["soft_obstacles"]
 
-    # Optimistic passability: anything not locked as obstacle is fair game.
-    def passable(cell):
+    # A cell that's been seen as 0.75 many times without compensating low
+    # readings is probably a wall the planner should route around early
+    # (instead of marching us into it and then re-rolling).
+    def strong_suspect(cell):
+        h_ = high_reads.get(cell, 0)
+        l_ = low_reads.get(cell, 0)
+        return h_ >= 3 and h_ > 2 * l_
+
+    def strict_passable(cell):
+        return (cell not in obstacles
+                and cell not in soft_obstacles
+                and not strong_suspect(cell))
+
+    # Fallback: only respect hard-locked obstacles.
+    def loose_passable(cell):
         return cell not in obstacles
 
-    # 1) If we've spotted the goal, plan straight to it.
-    path = None
-    if goal is not None:
-        path = _bfs(pos, lambda c: c == goal, passable, w, h)
-
-    # 2) Otherwise, walk to the nearest frontier tile (known-free next to unknown).
-    if path is None:
+    def find_path(passable_fn):
+        if goal is not None:
+            p = _bfs(pos, lambda c: c == goal, passable_fn, w, h)
+            if p is not None:
+                return p
+        # Frontier: locked-free with an unclassified neighbor.
         def is_frontier(c):
             if c not in free:
                 return False
@@ -128,17 +159,22 @@ def choose_action(game_state: GameState) -> str:
                 nb = (cx + dx, cy + dy)
                 if not (0 <= nb[0] < w and 0 <= nb[1] < h):
                     continue
-                if nb not in free and nb not in obstacles:
-                    return True
+                if nb in free or nb in obstacles:
+                    continue
+                return True
             return False
-        path = _bfs(pos, is_frontier, passable, w, h)
+        p = _bfs(pos, is_frontier, passable_fn, w, h)
+        if p is not None:
+            return p
+        return _bfs(pos, lambda c: c not in free and c not in obstacles,
+                    passable_fn, w, h)
 
-    # 3) Last resort: head to any reachable unknown cell.
+    path = find_path(strict_passable)
     if path is None:
-        path = _bfs(pos, lambda c: c not in free and c not in obstacles,
-                    passable, w, h)
+        # Strict view blocked us in -- forget soft strikes and try again.
+        soft_obstacles.clear()
+        path = find_path(loose_passable)
 
-    # Nothing reachable -> spin in place to keep re-sensing.
     if path is None or len(path) < 2:
         return 'E' if orient_letter == 'N' else 'N'
 
@@ -147,24 +183,31 @@ def choose_action(game_state: GameState) -> str:
     if needed is None:
         return 'N'
 
-    # Turn first if not facing the right way.
     if orient_letter != needed:
         return needed
 
-    # Look-before-you-leap. We're facing next_cell, so it's in our front cone
-    # and the current reading is fresh.
+    # Look-before-you-leap, using *accumulated* evidence rather than the last
+    # single reading. A real obstacle very rarely sustains low > high without
+    # ever hitting 1.0, so this is much safer than trusting one 0.25.
     if next_cell not in free:
-        nx, ny = next_cell
-        reading = pm[ny, nx]
-        # Anything firmer than "low confidence free" -> don't step yet.
-        # 0.0/2.0 would have been locked into `free` above, so this guards
-        # against 0.5/0.75 (and a paranoid bound on 1.0 which is unreachable
-        # here because BFS rejects locked obstacles).
-        if reading > 0.25 and reading != 2.0:
-            # Turn perpendicular to re-roll perception next tick. The same
-            # cell will remain in our sensor cone as a side reading.
+        low = low_reads.get(next_cell, 0)
+        high = high_reads.get(next_cell, 0)
+        if not (low >= 2 and low > high):
+            if _belief["stuck_target"] != next_cell:
+                _belief["stuck_target"] = next_cell
+                _belief["stuck_count"] = 0
+            _belief["stuck_count"] += 1
+            if _belief["stuck_count"] >= 5:
+                # Spun too long; give up on this cell and let BFS reroute.
+                soft_obstacles.add(next_cell)
+                _belief["stuck_target"] = None
+                _belief["stuck_count"] = 0
+            # Re-roll perception by turning perpendicular; the target cell
+            # stays in our sensor cone as a side reading next tick.
             return 'E' if needed in ('N', 'S') else 'N'
 
+    _belief["stuck_target"] = None
+    _belief["stuck_count"] = 0
     return 'M'
 
 
